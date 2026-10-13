@@ -9,6 +9,8 @@ namespace py = pybind11;
 #include <MeshFEMSparse/SparseMatrices.hh>
 #include <MeshFEMSparse/Solvers/SPSDSystem.hh>
 #include <MeshFEMSparse/Solvers/MatrixRecorder.hh>
+#include <MeshFEMSparse/Solvers/Iterative/MASPreconditioner.hh>
+#include <MeshFEMSparse/Solvers/Iterative/PCG.hh>
 
 #if MESHFEM_WITH_CATAMARI
 #include <MeshFEMSparse/Solvers/CatamariFactorizer.hh>
@@ -356,6 +358,87 @@ PYBIND11_MODULE(sparse_matrices, m) {
         ;
     pyPF.def_readwrite("orderingMethod", &PF::orderingMethod);
 #endif
+
+    ////////////////////////////////////////////////////////////////////////////
+    // Iterative solvers
+    ////////////////////////////////////////////////////////////////////////////
+    auto checkedApply = [](const auto &op, const Eigen::VectorXd &x) {
+        if (size_t(x.size()) != op.size()) throw std::runtime_error("Vector size does not match the operator size");
+        Eigen::VectorXd y(x.size());
+        op.apply(x.data(), y.data());
+        return y;
+    };
+
+    py::class_<LinearOperator>(detail_module, "LinearOperator")
+        .def("size",  &LinearOperator::size)
+        .def("apply", [checkedApply](const LinearOperator &A, const Eigen::VectorXd &x) { return checkedApply(A, x); }, py::arg("x"), "Compute A x")
+        ;
+
+    py::class_<Preconditioner>(detail_module, "Preconditioner")
+        .def("size",  &Preconditioner::size)
+        .def("apply", [checkedApply](const Preconditioner &M, const Eigen::VectorXd &r) { return checkedApply(M, r); }, py::arg("r"), "Compute M^{-1} r")
+        ;
+
+    // The operator references (does not copy) the matrix, so keep it alive.
+    py::class_<SymmetricMatrixOperator, LinearOperator>(m, "SymmetricMatrixOperator",
+            "(A + sigma I) on the free variables and the identity on the pinned ones, for a symmetric matrix A stored as its upper triangle. "
+            "A is referenced, not copied: later changes to its values are seen by the operator.")
+        .def(py::init<const BlockCSCHessianBase &, const std::vector<size_t> &, Real>(), py::arg("A"), py::arg("pinnedVars") = std::vector<size_t>(), py::arg("sigma") = 0.0, py::keep_alive<1, 2>())
+        .def(py::init<const SuiteSparseMatrix   &, const std::vector<size_t> &, Real>(), py::arg("A"), py::arg("pinnedVars") = std::vector<size_t>(), py::arg("sigma") = 0.0, py::keep_alive<1, 2>())
+        .def_property("sigma", &SymmetricMatrixOperator::sigma, &SymmetricMatrixOperator::setSigma)
+        ;
+
+    using MAS = MASPreconditioner;
+    py::class_<MAS, Preconditioner> pyMAS(m, "MASPreconditioner",
+            "Multilevel additive Schwarz preconditioner of StiffGIPC (Huang et al. 2025). "
+            "Call analyzePattern once per sparsity pattern, then compute whenever the values change.");
+    py::enum_<MAS::PartitionMethod>(pyMAS, "PartitionMethod")
+        .value("Auto",   MAS::PartitionMethod::Auto)
+        .value("Metis",  MAS::PartitionMethod::Metis)
+        .value("Greedy", MAS::PartitionMethod::Greedy)
+        ;
+    pyMAS
+        .def(py::init<>())
+        .def_readonly_static("BankSize", &MAS::BankSize)
+        .def_readwrite("maxLevels",       &MAS::maxLevels)
+        .def_readwrite("nodeBlockSize",   &MAS::nodeBlockSize)
+        .def_readwrite("partitionMethod", &MAS::partitionMethod)
+        .def_static("metisAvailable", &MAS::metisAvailable)
+        .def("analyzePattern", py::overload_cast<const BlockCSCHessianBase &, const std::vector<size_t> &>(&MAS::analyzePattern), py::arg("A"), py::arg("pinnedVars") = std::vector<size_t>())
+        .def("analyzePattern", py::overload_cast<const SuiteSparseMatrix   &, const std::vector<size_t> &>(&MAS::analyzePattern), py::arg("A"), py::arg("pinnedVars") = std::vector<size_t>())
+        .def("compute", py::overload_cast<const BlockCSCHessianBase &, Real>(&MAS::compute), py::arg("A"), py::arg("sigma") = 0.0, "Build the preconditioner for A + sigma I")
+        .def("compute", py::overload_cast<const SuiteSparseMatrix   &, Real>(&MAS::compute), py::arg("A"), py::arg("sigma") = 0.0, "Build the preconditioner for A + sigma I")
+        .def("isComputed", &MAS::isComputed)
+        .def("clear",      &MAS::clear)
+        .def("numLevels",     &MAS::numLevels)
+        .def("numLevelNodes", &MAS::numLevelNodes, py::arg("level"))
+        .def("numSubdomains", &MAS::numSubdomains, py::arg("level"))
+        .def("nodeBlockSizeUsed", &MAS::nodeBlockSizeUsed)
+        .def("usedMetis",         &MAS::usedMetis)
+        ;
+
+    py::class_<PCG> pyPCG(m, "PCG", "Preconditioned conjugate gradient (starting from x = 0)");
+    py::class_<PCG::Stats>(pyPCG, "Stats")
+        .def_readonly("iterations",        &PCG::Stats::iterations)
+        .def_readonly("relResidual",       &PCG::Stats::relResidual)
+        .def_readonly("converged",         &PCG::Stats::converged)
+        .def_readonly("negativeCurvature", &PCG::Stats::negativeCurvature)
+        .def("__repr__", [](const PCG::Stats &s) {
+                return "PCG.Stats(iterations=" + std::to_string(s.iterations) + ", relResidual=" + std::to_string(s.relResidual)
+                     + ", converged=" + (s.converged ? "True" : "False") + ", negativeCurvature=" + (s.negativeCurvature ? "True" : "False") + ")";
+            })
+        ;
+    pyPCG
+        .def(py::init<>())
+        .def_readwrite("relTol",   &PCG::relTol)
+        .def_readwrite("maxIters", &PCG::maxIters)
+        .def_readwrite("throwOnNegativeCurvature", &PCG::throwOnNegativeCurvature)
+        .def_readwrite("throwOnNonConvergence",    &PCG::throwOnNonConvergence)
+        .def("solve", [](const PCG &pcg, const LinearOperator &A, const Preconditioner &M, const Eigen::VectorXd &b) {
+                return pcg.solve(A, M, b);
+            }, py::arg("A"), py::arg("M"), py::arg("b"), "Solve A x = b; statistics are available from lastStats()")
+        .def("lastStats", &PCG::lastStats, py::return_value_policy::copy)
+        ;
 
     m.def("CholeskyFactorizer", [](CholeskyProvider p, bool singlePrecision) { return make_cholesky_factorizer(p, singlePrecision); },
           py::arg("provider") = get_default_cholesky_provider(), py::arg("singlePrecision") = false,

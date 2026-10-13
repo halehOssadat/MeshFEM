@@ -65,6 +65,8 @@ PYBIND11_MODULE(block_sparse_hessian, m) {
         .def("blockSizeGCD",     &BlockCSCHessianBase::blockSizeGCD)
         .def("hasContiguousBlocks", &BlockCSCHessianBase::hasContiguousBlocks, "Whether the blocks are stored contiguously in memory")
 
+        .def_static("fromScalar", [](const SuiteSparseMatrix &A, int blockSize) { return std::shared_ptr<BlockCSCHessianBase>(BlockCSCHessianBase::fromScalar(A, blockSize)); },
+                    py::arg("A"), py::arg("blockSize") = 1, "Construct from the upper triangle of a scalar symmetric matrix")
         .def("clone", [](const BlockCSCHessianBase &H) -> std::shared_ptr<BlockCSCHessianBase> { return H.clone(); })
         .def("mergeSparsityPattern", [](BlockCSCHessianBase &H, const BlockCSCHessianBase &other) { H.mergeSparsityPattern(other); }, py::arg("other"))
 
